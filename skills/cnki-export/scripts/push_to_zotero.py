@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Push CNKI paper data to Zotero via local Connector API (localhost:23119)."""
+"""Push CNKI paper data to Zotero via local Connector API (localhost:23119).
+
+Session strategy: deterministic sessionID derived from content hash.
+- 201 = saved successfully
+- 409 = SESSION_EXISTS = already saved (idempotent, treat as success)
+- Zotero's session gc/remove are buggy, sessions persist until restart.
+  Deterministic IDs turn this bug into a feature: same content → same ID → 409 = already done.
+"""
 
 import json
 import sys
 import io
+import hashlib
 import urllib.request
 import urllib.error
 import re
@@ -13,10 +21,11 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 ZOTERO_API = 'http://127.0.0.1:23119/connector'
+HTTP_TIMEOUT = 15  # seconds, matching Zotero Connector extension
 
 
-def zotero_request(endpoint, data=None):
-    """Send request to Zotero local API."""
+def zotero_request(endpoint, data=None, timeout=HTTP_TIMEOUT):
+    """Send request to Zotero local API with timeout."""
     url = f'{ZOTERO_API}/{endpoint}'
     body = json.dumps(data or {}, ensure_ascii=False).encode('utf-8')
     req = urllib.request.Request(url, data=body, headers={
@@ -24,13 +33,30 @@ def zotero_request(endpoint, data=None):
         'X-Zotero-Connector-API-Version': '3'
     })
     try:
-        resp = urllib.request.urlopen(req)
+        resp = urllib.request.urlopen(req, timeout=timeout)
         text = resp.read().decode('utf-8')
         return resp.status, json.loads(text) if text else None
     except urllib.error.HTTPError as e:
-        return e.code, None
+        resp_body = e.read().decode('utf-8', errors='replace')
+        try:
+            return e.code, json.loads(resp_body) if resp_body else None
+        except json.JSONDecodeError:
+            return e.code, {'error': resp_body}
     except urllib.error.URLError:
         return 0, None
+    except TimeoutError:
+        return -1, {'error': f'请求超时 ({timeout}s)'}
+
+
+def make_session_id(items):
+    """Generate deterministic sessionID from item content (titles hash).
+
+    Same items always produce the same ID, so:
+    - First call: creates session, saves items → 201
+    - Repeat call: session exists → 409 → treat as already saved
+    """
+    key = '|'.join(sorted(item.get('title', '') for item in items))
+    return hashlib.md5(key.encode('utf-8', errors='surrogateescape')).hexdigest()[:12]
 
 
 def get_selected_collection():
@@ -149,11 +175,65 @@ def build_zotero_item(paper):
     return item
 
 
-def save_items(items, uri=''):
-    """Push items to Zotero via saveItems API."""
-    import random
-    import string
-    session_id = ''.join(random.choices(string.ascii_letters + string.digits, k=8))
+def download_pdf(pdf_url, cookies='', referer='https://kns.cnki.net'):
+    """Download PDF from CNKI using provided cookies. Returns (bytes, content_type) or (None, error)."""
+    req = urllib.request.Request(pdf_url, headers={
+        'Cookie': cookies,
+        'Referer': referer,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/131.0.0.0',
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+        content_type = resp.headers.get('Content-Type', 'application/pdf')
+        data = resp.read()
+        if len(data) < 1024:
+            return None, f'PDF 文件太小 ({len(data)} bytes)，可能需要登录'
+        return data, content_type
+    except Exception as e:
+        return None, str(e)
+
+
+def save_attachment(session_id, item_id, pdf_bytes, pdf_url, content_type='application/pdf', title='Full Text PDF'):
+    """Upload PDF binary to Zotero via /connector/saveAttachment (Zotero 7.x workflow)."""
+    metadata = json.dumps({
+        'id': item_id + '_pdf',
+        'parentItemID': item_id,
+        'title': title,
+        'url': pdf_url,
+        'contentType': content_type,
+    })
+    url = f'{ZOTERO_API}/saveAttachment?sessionID={session_id}'
+    req = urllib.request.Request(url, data=pdf_bytes, headers={
+        'Content-Type': content_type,
+        'X-Metadata': metadata,
+        'Content-Length': str(len(pdf_bytes)),
+        'X-Zotero-Connector-API-Version': '3',
+    })
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+        return resp.status, None
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode('utf-8', errors='replace')
+    except Exception as e:
+        return 0, str(e)
+
+
+def save_items(items, uri='', attachments=None, cookies=''):
+    """Push items to Zotero via saveItems API, optionally with PDF attachments.
+
+    Uses deterministic sessionID (content hash) for idempotency:
+    - 201 = saved successfully
+    - 409 = same items already saved in this Zotero session (success)
+
+    If attachments are provided, downloads and uploads PDFs after saving metadata.
+    attachments format: [{"itemIndex": 0, "pdfUrl": "https://...", "title": "Full Text PDF"}, ...]
+    """
+    session_id = make_session_id(items)
+
+    # Assign IDs to items (needed for attachment parentItemID mapping)
+    for i, item in enumerate(items):
+        if 'id' not in item:
+            item['id'] = f'cnki_{session_id}_{i}'
 
     data = {
         'sessionID': session_id,
@@ -161,7 +241,61 @@ def save_items(items, uri=''):
         'items': items
     }
     status, resp = zotero_request('saveItems', data)
-    return status
+
+    already_saved = False
+    if status == 201:
+        msg = f'保存成功 (session: {session_id})'
+    elif status == 409:
+        already_saved = True
+        msg = f'这批论文已保存过，无需重复添加 (session: {session_id})'
+    elif status == 500:
+        detail = resp.get('error', '') if resp else ''
+        if 'libraryEditable' in str(resp):
+            return 500, '目标文库为只读，请在 Zotero 中切换到可写的分类'
+        return 500, f'Zotero 内部错误: {detail}'
+    elif status == 0:
+        return 0, 'Zotero 未运行或连接被拒绝'
+    elif status == -1:
+        return -1, f'请求超时 ({HTTP_TIMEOUT}s)，Zotero 可能正在处理大量数据'
+    else:
+        return status, f'未知错误，HTTP {status}'
+
+    # Handle PDF attachments (only for new saves, skip if already saved)
+    if attachments and not already_saved:
+        # Check if target collection supports files
+        col = get_selected_collection()
+        files_editable = col.get('filesEditable', True) if col else True
+
+        if files_editable:
+            pdf_results = []
+            for att in attachments:
+                idx = att.get('itemIndex', 0)
+                pdf_url = att.get('pdfUrl', '')
+                title = att.get('title', 'Full Text PDF')
+                if not pdf_url:
+                    continue
+
+                item_id = items[idx]['id'] if idx < len(items) else items[0]['id']
+                print(f'  下载 PDF: {pdf_url[:80]}...', file=sys.stderr)
+                pdf_bytes, ct = download_pdf(pdf_url, cookies=cookies)
+
+                if pdf_bytes is None:
+                    pdf_results.append(f'  PDF 下载失败: {ct}')
+                    continue
+
+                print(f'  上传 PDF 到 Zotero ({len(pdf_bytes)} bytes)...', file=sys.stderr)
+                att_status, att_err = save_attachment(session_id, item_id, pdf_bytes, pdf_url, title=title)
+                if att_status == 201:
+                    pdf_results.append(f'  PDF 已附加: {title} ({len(pdf_bytes) // 1024}KB)')
+                else:
+                    pdf_results.append(f'  PDF 上传失败: HTTP {att_status} {att_err or ""}')
+
+            if pdf_results:
+                msg += '\n' + '\n'.join(pdf_results)
+        else:
+            msg += '\n  (目标分类不支持文件附件，跳过 PDF)'
+
+    return 201, msg
 
 
 def main():
@@ -193,11 +327,12 @@ def main():
         papers = paper_data
     elif 'items' in paper_data:
         # Already in Zotero format
-        status = save_items(paper_data['items'], paper_data.get('uri', ''))
+        status, msg = save_items(paper_data['items'], paper_data.get('uri', ''))
         if status == 201:
-            print(f'成功添加 {len(paper_data["items"])} 篇论文到 Zotero！')
+            print(f'成功: {msg} ({len(paper_data["items"])} 篇)')
         else:
-            print(f'添加失败，状态码: {status}')
+            print(f'失败: {msg}')
+            sys.exit(1)
         return
     else:
         papers = [paper_data]
@@ -223,14 +358,27 @@ def main():
         print('Error: 无有效论文数据。')
         sys.exit(1)
 
+    # Collect attachment info and cookies from input
+    attachments = []
+    cookies = ''
+    for i, p in enumerate(papers):
+        if p.get('pdfUrl'):
+            attachments.append({
+                'itemIndex': i,
+                'pdfUrl': p['pdfUrl'],
+                'title': p.get('pdfTitle', 'Full Text PDF'),
+            })
+        if p.get('cookies') and not cookies:
+            cookies = p['cookies']
+
     uri = papers[0].get('pageUrl', papers[0].get('link', ''))
-    status = save_items(items, uri)
+    status, msg = save_items(items, uri, attachments=attachments, cookies=cookies)
     if status == 201:
-        print(f'成功添加 {len(items)} 篇论文到 Zotero！')
+        print(f'成功: {msg} ({len(items)} 篇)')
         for item in items:
             print(f'  - {item.get("title", "?")}')
     else:
-        print(f'添加失败，状态码: {status}')
+        print(f'失败: {msg}')
         sys.exit(1)
 
 
