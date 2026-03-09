@@ -122,10 +122,7 @@ agents/
 
 ## 中文
 
-| 公众号 | 微信交流群 | Discord |
-|:---:|:---:|:---:|
-| <img src="qrcode_for_gh_a1c14419b847_258.jpg" width="200"> | <img src="0309.jpg" width="200"> | [加入 Discord](https://discord.gg/tGd5vTDASg) |
-| 未来论文实验室 | 扫码加入交流群 | 中英文交流 |
+
 
 让 [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 通过 Chrome DevTools MCP 操作 [中国知网 (CNKI)](https://www.cnki.net) 的技能集。
 
